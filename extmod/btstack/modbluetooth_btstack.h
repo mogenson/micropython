@@ -33,6 +33,19 @@
 
 #include "lib/btstack/src/btstack.h"
 
+#if MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+#include "py/ringbuf.h"
+typedef struct _mp_btstack_l2cap_channel_t {
+    uint16_t cid;
+    uint16_t conn_handle;
+    uint16_t our_mtu;
+    uint16_t psm;
+    uint8_t *rx_sdu;
+    ringbuf_t ringbuf;
+    bool listening;
+} mp_btstack_l2cap_channel_t;
+#endif // MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+
 typedef struct _mp_btstack_pending_op_t mp_btstack_pending_op_t;
 
 typedef struct _mp_bluetooth_btstack_root_pointers_t {
@@ -50,6 +63,10 @@ typedef struct _mp_bluetooth_btstack_root_pointers_t {
     // Registration for notify/indicate events.
     gatt_client_notification_t notification;
     #endif
+
+    #if MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+    mp_btstack_l2cap_channel_t l2cap_channel;
+    #endif // MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
 } mp_bluetooth_btstack_root_pointers_t;
 
 enum {

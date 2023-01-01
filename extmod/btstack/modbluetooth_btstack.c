@@ -514,6 +514,117 @@ STATIC btstack_packet_callback_registration_t hci_event_callback_registration = 
     .callback = &btstack_packet_handler_generic
 };
 
+#if MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+STATIC void btstack_destroy_l2cap_channel(void) {
+    uint8_t *rx_sdu = MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.rx_sdu;
+    uint16_t our_mtu = MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.our_mtu;
+    if (rx_sdu != NULL && our_mtu > 0) {
+        m_del(uint8_t, rx_sdu, our_mtu);
+    }
+    ringbuf_t *ringbuf = &MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.ringbuf;
+    if (ringbuf->buf != NULL && ringbuf->size > 0) {
+        m_del(uint8_t, ringbuf->buf, ringbuf->size);
+    }
+    memset(&MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel, 0, sizeof(mp_btstack_l2cap_channel_t));
+}
+
+// Packet handler for L2CAP events and data.
+STATIC void btstack_packet_handler_l2cap(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+    (void)channel;
+    DEBUG_printf("btstack_packet_handler_l2cap(packet_type=%u, packet=%p)\n", packet_type, packet);
+
+    switch (packet_type) {
+        case HCI_EVENT_PACKET:
+            switch (hci_event_packet_get_type(packet)) {
+                case L2CAP_EVENT_CBM_INCOMING_CONNECTION: {
+                    DEBUG_printf("  --> l2cap accept\n");
+                    uint16_t psm = l2cap_event_cbm_incoming_connection_get_psm(packet);
+                    uint16_t cid = l2cap_event_cbm_incoming_connection_get_local_cid(packet);
+                    uint16_t conn_handle = l2cap_event_cbm_incoming_connection_get_handle(packet);
+                    uint16_t peer_mtu = l2cap_event_cbm_incoming_connection_get_remote_mtu(packet);
+                    if (psm == MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.psm) {
+                        uint16_t our_mtu = MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.our_mtu;
+                        int result = mp_bluetooth_on_l2cap_accept(conn_handle, cid, psm, our_mtu, peer_mtu);
+                        if (result == 0) {
+                            MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.conn_handle = conn_handle;
+                            MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.cid = cid;
+                            MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.listening = false;
+                            uint8_t *rx_sdu = m_new(uint8_t, our_mtu);
+                            MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.rx_sdu = rx_sdu;
+                            l2cap_cbm_accept_connection(cid, rx_sdu, our_mtu, L2CAP_LE_AUTOMATIC_CREDITS);
+                        } else {
+                            l2cap_cbm_decline_connection(cid, (uint16_t)(result < 0 ? -result : result));
+                        }
+                    }
+
+                }
+                break;
+                case L2CAP_EVENT_CBM_CHANNEL_OPENED: {
+                    DEBUG_printf("  --> l2cap connect\n");
+                    uint16_t psm = l2cap_event_cbm_channel_opened_get_psm(packet);
+                    uint16_t conn_handle = l2cap_event_cbm_channel_opened_get_handle(packet);
+                    uint8_t status = l2cap_event_cbm_channel_opened_get_status(packet);
+                    if (conn_handle == MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.conn_handle &&
+                        psm == MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.psm) {
+                        uint16_t cid = l2cap_event_cbm_channel_opened_get_local_cid(packet);
+                        if (status == ERROR_CODE_SUCCESS) {
+                            uint16_t peer_mtu = l2cap_event_cbm_channel_opened_get_remote_mtu(packet);
+                            uint16_t our_mtu = MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.our_mtu;
+                            MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.cid = cid;
+                            ringbuf_alloc(&MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.ringbuf, 2 * our_mtu + 1);
+                            mp_bluetooth_on_l2cap_connect(conn_handle, cid, psm, our_mtu, peer_mtu);
+                            l2cap_request_can_send_now_event(cid);
+                        } else {
+                            mp_bluetooth_on_l2cap_disconnect(conn_handle, cid, psm, 0);
+                            btstack_destroy_l2cap_channel();
+                        }
+                    }
+                }
+                break;
+                case L2CAP_EVENT_CAN_SEND_NOW: {
+                    DEBUG_printf("  --> l2cap send ready\n");
+                    uint16_t cid = l2cap_event_can_send_now_get_local_cid(packet);
+                    if (cid == MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.cid) {
+                        uint16_t conn_handle = MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.conn_handle;
+                        mp_bluetooth_on_l2cap_send_ready(conn_handle, cid, 0);
+                    }
+                }
+                break;
+                case L2CAP_EVENT_CHANNEL_CLOSED: {
+                    DEBUG_printf("  --> l2cap disconnect\n");
+                    uint16_t cid = l2cap_event_channel_closed_get_local_cid(packet);
+                    if (cid == MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.cid) {
+                        uint16_t conn_handle = MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.conn_handle;
+                        uint16_t psm = MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.psm;
+                        mp_bluetooth_on_l2cap_disconnect(conn_handle, cid, psm, 0);
+                        btstack_destroy_l2cap_channel();
+                    }
+                }
+                break;
+                default:
+                    DEBUG_printf("  --> hci event type: unknown (0x%02x)\n", hci_event_packet_get_type(packet));
+                    break;
+            }
+            break;
+        case L2CAP_DATA_PACKET: {
+            DEBUG_printf("  --> l2cap recv\n");
+            ringbuf_t *ringbuf = &MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.ringbuf;
+            for (uint16_t i = 0; i < size; ++i) {
+                ringbuf_put(ringbuf, packet[i]);
+            }
+        }
+        break;
+        default:
+            DEBUG_printf("  --> packet type: unknown (0x%02x)\n", packet_type);
+            break;
+    }
+}
+
+STATIC btstack_packet_callback_registration_t l2cap_event_callback_registration = {
+    .callback = &btstack_packet_handler_l2cap
+};
+#endif // MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+
 #if MICROPY_PY_BLUETOOTH_ENABLE_GATT_CLIENT
 // For when the handler is being used for service discovery.
 STATIC void btstack_packet_handler_discover_services(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -692,6 +803,12 @@ int mp_bluetooth_init(void) {
 
     // Register for HCI events.
     hci_add_event_handler(&hci_event_callback_registration);
+
+    #if MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
+    // Register for L2CAP events.
+    // hci_add_event_handler(&l2cap_event_callback_registration);
+    l2cap_add_event_handler(&l2cap_event_callback_registration);
+    #endif // MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
 
     // Register for ATT server events.
     att_server_register_packet_handler(&btstack_packet_handler_att_server);
@@ -1454,27 +1571,63 @@ int mp_bluetooth_gattc_exchange_mtu(uint16_t conn_handle) {
 
 int mp_bluetooth_l2cap_listen(uint16_t psm, uint16_t mtu) {
     DEBUG_printf("mp_bluetooth_l2cap_listen: psm=%d, mtu=%d\n", psm, mtu);
-    return MP_EOPNOTSUPP;
+    MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.psm = psm;
+    MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.our_mtu = mtu;
+    MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.listening = true;
+    return btstack_error_to_errno(l2cap_cbm_register_service(&btstack_packet_handler_l2cap, psm, LEVEL_0));
 }
 
 int mp_bluetooth_l2cap_connect(uint16_t conn_handle, uint16_t psm, uint16_t mtu) {
     DEBUG_printf("mp_bluetooth_l2cap_connect: conn_handle=%d, psm=%d, mtu=%d\n", conn_handle, psm, mtu);
-    return MP_EOPNOTSUPP;
+    MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.conn_handle = conn_handle;
+    MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.psm = psm;
+    MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.our_mtu = mtu;
+    uint8_t *rx_sdu = m_new(uint8_t, mtu);
+    MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.rx_sdu = rx_sdu;
+    uint16_t *cid = &MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.cid;
+    return btstack_error_to_errno(l2cap_cbm_create_channel(&btstack_packet_handler_l2cap, conn_handle, psm, rx_sdu,
+        mtu, L2CAP_LE_AUTOMATIC_CREDITS, LEVEL_0, cid));
 }
 
 int mp_bluetooth_l2cap_disconnect(uint16_t conn_handle, uint16_t cid) {
     DEBUG_printf("mp_bluetooth_l2cap_disconnect: conn_handle=%d, cid=%d\n", conn_handle, cid);
-    return MP_EOPNOTSUPP;
+    return btstack_error_to_errno(l2cap_disconnect(cid));
 }
 
 int mp_bluetooth_l2cap_send(uint16_t conn_handle, uint16_t cid, const uint8_t *buf, size_t len, bool *stalled) {
     DEBUG_printf("mp_bluetooth_l2cap_send: conn_handle=%d, cid=%d, len=%d\n", conn_handle, cid, (int)len);
-    return MP_EOPNOTSUPP;
+    UNUSED(conn_handle);
+
+    *stalled = false;
+    int err = btstack_error_to_errno(l2cap_send(cid, buf, (uint16_t)len));
+    l2cap_request_can_send_now_event(cid);
+    return err;
 }
 
 int mp_bluetooth_l2cap_recvinto(uint16_t conn_handle, uint16_t cid, uint8_t *buf, size_t *len) {
     DEBUG_printf("mp_bluetooth_l2cap_recvinto: conn_handle=%d, cid=%d, len=%d\n", conn_handle, cid, (int)*len);
-    return MP_EOPNOTSUPP;
+    if (conn_handle != MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.conn_handle ||
+        cid != MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.cid) {
+        return MP_EINVAL;
+    }
+
+    MICROPY_PY_BLUETOOTH_ENTER
+    ringbuf_t *ringbuf = &MP_STATE_PORT(bluetooth_btstack_root_pointers)->l2cap_channel.ringbuf;
+    if (ringbuf->buf != NULL && ringbuf->size > 0) {
+        size_t avail = ringbuf_avail(ringbuf);
+        if (buf == NULL) {
+            *len = avail;
+        } else {
+            *len = MIN(*len, avail);
+            for (size_t i = 0; i < *len; ++i) {
+                buf[i] = ringbuf_get(ringbuf);
+            }
+        }
+    } else {
+        *len = 0;
+    }
+    MICROPY_PY_BLUETOOTH_EXIT
+    return 0;
 }
 
 #endif // MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS
