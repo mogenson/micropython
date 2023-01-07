@@ -45,7 +45,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DEBUG_printf(...) // printf(__VA_ARGS__)
+#include <stdio.h>
+#define DEBUG_printf(...) printf(__VA_ARGS__)
 #define DEBUG_HCI_DUMP (0)
 
 uint8_t mp_bluetooth_hci_cmd_buf[4 + 256];
@@ -119,7 +120,7 @@ STATIC int configure_uart(void) {
 
     // Get existing config.
     if (tcgetattr(uart_fd, &toptions) < 0) {
-        DEBUG_printf("Couldn't get term attributes");
+        DEBUG_printf("Couldn't get term attributes\n");
         return -1;
     }
 
@@ -149,7 +150,7 @@ STATIC int configure_uart(void) {
 
     // Apply immediately.
     if (tcsetattr(uart_fd, TCSANOW, &toptions) < 0) {
-        DEBUG_printf("Couldn't set term attributes");
+        DEBUG_printf("Couldn't set term attributes\n");
 
         close(uart_fd);
         uart_fd = -1;
